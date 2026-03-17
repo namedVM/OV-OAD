@@ -1,0 +1,35 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Hugging Face Accelerate 启动配置
+#
+# 使用方式：
+#   accelerate launch --config_file accelerate_config.yml train.py \
+#       --config configs/train.yml [其他 CLI 覆盖参数]
+#
+# 或者先运行交互式向导生成配置（会覆盖本文件）：
+#   accelerate config
+# ─────────────────────────────────────────────────────────────────────────────
+
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU          # 单机多卡 DDP；单卡改为 NO
+
+# ── GPU 设置 ──────────────────────────────────────────
+num_processes: 8                     # 使用的 GPU 数量（与 CUDA_VISIBLE_DEVICES 对应）
+gpu_ids: all                         # "all" 或逗号分隔 ID，如 "0,1,2,3"
+
+# ── 通信后端 ──────────────────────────────────────────
+machine_rank: 0                      # 单机训练保持 0
+main_process_ip: null                # 多机训练时填主节点 IP
+main_process_port: 29500             # 多机训练时填主节点端口
+num_machines: 1                      # 单机训练保持 1
+
+# ── 混合精度 ──────────────────────────────────────────
+# 可选值：no / fp16 / bf16
+# bf16 需要 Ampere 及以上架构（A100/H100/4090 等）
+mixed_precision: bf16
+
+# ── 其他 ──────────────────────────────────────────────
+dynamo_backend: NO                   # 可改为 INDUCTOR 启用 torch.compile
+downcast_bf16: 'no'
+rdzv_backend: static
+same_network: true
+use_cpu: false

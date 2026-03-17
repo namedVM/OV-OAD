@@ -1,0 +1,86 @@
+# ============================================================
+# OV-OAD 训练配置文件
+# 所有路径均可由 CLI 参数覆盖（CLI 优先级高于此配置）
+# ============================================================
+
+# ──────────────── 全局设置 ────────────────
+seed: 42
+print_freq: 50  # 每 N 个 global_step 打印一次日志
+debug: false    # true 时每 epoch 仅跑 10 个 step（快速验证）
+
+# ──────────────── 输出 ────────────────────
+output:
+  dir: ./outputs  # 输出根目录，每次运行自动在此创建时间戳子目录
+
+# ──────────────── 数据 ────────────────────
+data:
+  dir: ./data/features          # .pth 特征文件目录
+  metadata_csv: ./data/metadata.csv  # 类别元数据文件
+
+  val_ratio: 0.1                # 验证集占全部视频比例
+  nonzero_threshold: 0          # enc 窗口内非背景帧最低数量（0=不过滤）
+  stride: 1                     # 滑动窗口步长（训练集）
+
+  num_workers: 8                # DataLoader worker 数
+  preload: true                 # 预加载所有 .pth 到内存
+  num_preload_workers: 8        # 预加载线程数
+
+  bg_weight: 0.1                # 背景类采样/损失权重系数（< 1 实现降权）
+  use_weighted_sampler: true    # 单机时使用 WeightedRandomSampler
+
+# ──────────────── 模型 ────────────────────
+model:
+  clip_backbone: "ViT-B/32"     # CLIP 主干：ViT-B/32 | ViT-B/16 | ViT-L/14
+  read_from: "feat"             # feat（预提取）| png（在线提取）
+  zero_shot: false              # false=有监督；true=零样本对比
+  add_fuse: false               # 是否融合 enc+dec 特征
+
+  enc_steps: 32                 # OadTransformer Encoder 历史帧窗口大小
+  dec_steps: 8                  # Decoder 预测帧数（decoder_query_frames）
+
+  encoder_layers: 3             # Encoder Transformer 层数
+  decoder_layers: 5             # Decoder Transformer 层数
+  encoder_dim: 512              # Encoder 特征维度（需与 CLIP 输出维度匹配）
+  decoder_dim: 512              # Decoder 特征维度
+  encoder_heads: 8              # Encoder 注意力头数
+  decoder_heads: 4              # Decoder 注意力头数
+  mlp_ratio: 4.0                # FFN 扩展比
+  dropout: 0.1                  # Dropout 概率
+  enc_drop_path: 0.1            # Encoder Stochastic Depth 最大概率
+  dec_drop_path: 0.1            # Decoder Stochastic Depth 最大概率
+  directional_mask: true        # Decoder 是否使用因果掩码
+
+  freeze_mode: "none"           # none | both | image | text
+                                # none: 只训练 OadTransformer（CLIP 冻结）
+                                # both: 全量微调
+
+  loss_weight_enc: 1.0          # Encoder 损失权重
+  loss_weight_dec: 1.0          # Decoder 损失权重
+
+# ──────────────── 训练 ────────────────────
+train:
+  epochs: 30
+  batch_size: 32                # 每张 GPU 的 batch size
+
+  optimizer: "adamw"            # adamw | adam | sgd
+  lr: 6.4e-5                    # 基础学习率（会随 world_size 线性缩放）
+  weight_decay: 0.01            # 权重衰减（bias/LN 参数自动排除）
+  betas: [0.9, 0.999]           # AdamW beta 参数
+  eps: 1.0e-8                   # AdamW eps
+
+  scheduler: "cosine"           # cosine | linear | onecycle
+  warmup_epochs: 2              # Warmup epoch 数
+  min_lr: 1.6e-5                # Cosine 衰减最低学习率
+
+  clip_grad: 5.0                # 梯度裁剪最大 L2 范数（0 表示不裁剪）
+  accum_steps: 1                # 梯度累积步数（等效扩大 batch_size）
+
+# ──────────────── Checkpoint ──────────────
+checkpoint:
+  auto_resume: false            # true 时自动从最新 checkpoint 续训
+  save_freq: 5                  # 每 N epoch 保存一次 checkpoint
+
+# ──────────────── 评估 ────────────────────
+evaluate:
+  eval_freq: 5                  # 每 N epoch 评估一次
+  with_bg: false                # mAP 计算是否包含背景类

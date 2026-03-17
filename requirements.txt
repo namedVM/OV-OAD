@@ -1,24 +1,39 @@
-braceexpand==0.1.7
-datadings==3.4.6
-diffdist==0.1
-einops==0.4.1
-ftfy==6.0.3
-ipdb==0.13.9
-ipython==8.11.0
-kestrel==0.0.1
-nltk==3.8.1
-omegaconf==2.1.0
-# opencv_python==4.6.0.66
-pandarallel==1.6.4
-regex==2022.3.15
-requests==2.28.1
-scipy==1.7.3
-spacy==3.5.0
-tensorboard==2.11.0
-termcolor==2.2.0
-timm==0.6.12
-tqdm==4.64.1
-transformers==4.21.0
-wandb==0.13.7
-webdataset==0.1.103
-# yfcc100m==1.0.1
+# OV-OAD 依赖清单（重构版）
+# Python >= 3.12，CUDA >= 12.9
+#
+# ── 安装步骤 ──────────────────────────────────────────
+# 1. 创建 conda 环境
+#    conda create -n ovoad python=3.12 -y && conda activate ovoad
+#
+# 2. 安装 PyTorch（CUDA 12.4 wheel，兼容 CUDA 12.9 驱动）
+#    pip install torch torchvision torchaudio \
+#        --index-url https://download.pytorch.org/whl/cu124
+#
+# 3. 安装 CLIP
+#    pip install git+https://github.com/openai/CLIP.git
+#
+# 4. 安装其余依赖
+#    pip install -r requirements.txt
+
+# ── 深度学习核心 ──────────────────────────────────────
+# torch>=2.4.0    （由步骤 2 安装，不在此列）
+# torchvision>=0.19.0
+# torchaudio>=2.4.0
+
+# ── 分布式训练框架 ────────────────────────────────────
+accelerate>=0.31.0          # Accelerator / save_state / load_state / gather_for_metrics
+
+# ── Transformer 工具库 ────────────────────────────────
+timm>=1.0.3
+einops>=0.8.0
+
+# ── 配置与日志 ────────────────────────────────────────
+pyyaml>=6.0.1
+tensorboard>=2.17.0
+
+# ── 科学计算 ──────────────────────────────────────────
+numpy>=1.26.0
+scipy>=1.13.0
+
+# ── 工具 ──────────────────────────────────────────────
+tqdm>=4.66.0
