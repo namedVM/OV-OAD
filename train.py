@@ -19,12 +19,15 @@ OV-OAD 分布式训练脚本（基于 Hugging Face Accelerate）
     python train.py --config configs/train.yml \
         --resume outputs/run_xxx/checkpoints/step_1000 \
         --eval-only
+
+参数覆盖示例（两阶段解析，双下划线分隔嵌套键）：
+    python train.py --config configs/train.yml \
+        --train__lr 1e-4 --train__epochs 50 --model__enc_steps 64
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
 import datetime
 import logging
 import os
@@ -50,6 +53,7 @@ from ovoad.utils import (
     save_training_state,
     setup_logging,
 )
+from utils.arg_parser import build_two_stage_parser
 
 logger = logging.getLogger(__name__)
 
@@ -58,84 +62,50 @@ logger = logging.getLogger(__name__)
 # 配置管理
 # ────────────────────────────────────────────────────────────────────
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="OV-OAD 分布式训练（Accelerate）")
+def _add_train_extra_args(parser: argparse.ArgumentParser) -> None:
+    """注册训练脚本专属的额外 CLI 参数（不属于 config 嵌套结构）。
 
-    # 配置文件
-    parser.add_argument("--config", type=str, default="configs/train.yml", help="YAML 配置文件路径")
+    这些参数不会通过 ``k1__k2`` 双下划线机制写回 cfg，
+    而是由 main() 直接读取 args.xxx 使用。
 
-    # 数据（CLI 优先级高于配置文件）
-    parser.add_argument("--data-dir",      type=str,   help="覆盖：.pth 数据目录")
-    parser.add_argument("--metadata-csv",  type=str,   help="覆盖：metadata.csv 路径")
-    parser.add_argument("--output-dir",    type=str,   help="覆盖：输出根目录")
+    注意：config 顶层已有 ``seed`` 和 ``debug`` 字段，
+    两阶段解析会自动将其注册为 ``--seed`` 和 ``--debug``，
+    因此这里只注册 config 中不存在的专属控制参数。
+    """
+    # Checkpoint / 续训控制
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="从指定 checkpoint 目录恢复训练",
+    )
+    parser.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help="自动从 output 目录中最新的 checkpoint 续训",
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="仅运行评估，跳过训练循环",
+    )
 
-    # 训练超参
-    parser.add_argument("--epochs",        type=int,   help="覆盖：总 epoch 数")
-    parser.add_argument("--batch-size",    type=int,   help="覆盖：每卡 batch size")
-    parser.add_argument("--lr",            type=float, help="覆盖：基础学习率")
-    parser.add_argument("--weight-decay",  type=float, help="覆盖：权重衰减")
-    parser.add_argument("--clip-grad",     type=float, help="覆盖：梯度裁剪范数")
-    parser.add_argument("--accum-steps",   type=int,   help="覆盖：梯度累积步数")
-    parser.add_argument("--num-workers",   type=int,   help="覆盖：DataLoader workers")
+    # 混合精度（Accelerate 运行时选项，不属于 config 结构）
+    parser.add_argument(
+        "--mixed-precision",
+        type=str,
+        default="fp16",
+        choices=["no", "fp16", "bf16"],
+        help="混合精度训练类型（fp16 / bf16 / no）",
+    )
 
-    # 模型
-    parser.add_argument("--enc-steps",      type=int,  help="覆盖：Encoder 历史帧窗口")
-    parser.add_argument("--dec-steps",      type=int,  help="覆盖：Decoder 预测帧数")
-    parser.add_argument("--encoder-layers", type=int,  help="覆盖：Encoder 层数")
-    parser.add_argument("--decoder-layers", type=int,  help="覆盖：Decoder 层数")
-
-    # Checkpoint / 续训
-    parser.add_argument("--resume",        type=str,   help="从指定 checkpoint 目录恢复")
-    parser.add_argument("--auto-resume",   action="store_true", help="自动从最新 checkpoint 续训")
-    parser.add_argument("--save-freq",     type=int,   help="覆盖：每 N epoch 保存 checkpoint")
-    parser.add_argument("--eval-freq",     type=int,   help="覆盖：每 N epoch 评估")
-    parser.add_argument("--eval-only",     action="store_true", help="仅运行评估")
-
-    # 其他
-    parser.add_argument("--seed",          type=int, default=42, help="随机种子")
-    parser.add_argument("--mixed-precision", type=str, default="fp16",
-                        choices=["no", "fp16", "bf16"], help="混合精度类型")
-    parser.add_argument("--debug",         action="store_true", help="调试模式（少量 step）")
-    parser.add_argument("--tag",           type=str, default="", help="实验标签")
-
-    return parser.parse_args()
-
-
-def load_config(path: str) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def merge_cli_into_config(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, Any]:
-    """CLI 参数覆盖 YAML 配置（CLI 优先级更高）。"""
-    cfg = copy.deepcopy(cfg)
-    cli_map = {
-        "data_dir":       ("data", "dir"),
-        "metadata_csv":   ("data", "metadata_csv"),
-        "output_dir":     ("output", "dir"),
-        "epochs":         ("train", "epochs"),
-        "batch_size":     ("train", "batch_size"),
-        "lr":             ("train", "lr"),
-        "weight_decay":   ("train", "weight_decay"),
-        "clip_grad":      ("train", "clip_grad"),
-        "accum_steps":    ("train", "accum_steps"),
-        "num_workers":    ("data", "num_workers"),
-        "enc_steps":      ("model", "enc_steps"),
-        "dec_steps":      ("model", "dec_steps"),
-        "encoder_layers": ("model", "encoder_layers"),
-        "decoder_layers": ("model", "decoder_layers"),
-        "save_freq":      ("checkpoint", "save_freq"),
-        "eval_freq":      ("evaluate", "eval_freq"),
-    }
-    for arg_key, cfg_path in cli_map.items():
-        val = getattr(args, arg_key, None)
-        if val is None:
-            continue
-        node = cfg
-        for k in cfg_path[:-1]:
-            node = node.setdefault(k, {})
-        node[cfg_path[-1]] = val
-    return cfg
+    # 实验标签（仅影响运行目录命名，不属于 config 结构）
+    parser.add_argument(
+        "--tag",
+        type=str,
+        default="",
+        help="实验标签，附加到运行目录名称后缀",
+    )
 
 
 def make_run_dir(output_root: str | Path, tag: str = "") -> Path:
@@ -293,11 +263,17 @@ def validate(
 # ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    args = parse_args()
-
-    # ── 配置加载与合并 ────────────────────────────────────────────
-    cfg = load_config(args.config)
-    cfg = merge_cli_into_config(args, cfg)
+    # ── 两阶段参数解析 ────────────────────────────────────────────
+    # 第一阶段：解析 --config，加载 YAML 作为默认值基准
+    # 第二阶段：基于展平的 config 动态构建完整 ArgumentParser，
+    #           注册所有 --k1__k2 参数（config 值为 default），
+    #           再注册训练脚本专属参数（--resume / --seed / --eval-only 等）
+    # 写回：将所有最终生效值按 k1__k2 → cfg[k1][k2] 写回 cfg 字典
+    cfg, args = build_two_stage_parser(
+        description="OV-OAD 分布式训练（Accelerate）",
+        extra_args_fn=_add_train_extra_args,
+        default_config="configs/train.yml",
+    )
 
     train_cfg = cfg["train"]
     data_cfg  = cfg["data"]
