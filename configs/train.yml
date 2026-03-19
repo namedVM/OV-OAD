@@ -6,7 +6,7 @@
 # ──────────────── 全局设置 ────────────────
 seed: 42
 print_freq: 50  # 每 N 个 global_step 打印一次日志
-debug: false    # true 时每 epoch 仅跑 10 个 step（快速验证）
+debug: true    # true 时每 epoch 仅跑 10 个 step（快速验证）
 
 # ──────────────── 输出 ────────────────────
 output:
@@ -14,8 +14,8 @@ output:
 
 # ──────────────── 数据 ────────────────────
 data:
-  dir: ./data/features          # .pth 特征文件目录
-  metadata_csv: ./data/metadata.csv  # 类别元数据文件
+  dir: data/thumos14          # .pth 特征文件目录
+  metadata_csv: data/thumos14/meta.csv  # 类别元数据文件
 
   val_ratio: 0.1                # 验证集占全部视频比例
   nonzero_threshold: 0          # enc 窗口内非背景帧最低数量（0=不过滤）
@@ -32,7 +32,7 @@ data:
 model:
   clip_backbone: "ViT-B/32"     # CLIP 主干：ViT-B/32 | ViT-B/16 | ViT-L/14
   read_from: "feat"             # feat（预提取）| png（在线提取）
-  zero_shot: false              # false=有监督；true=零样本对比
+  zero_shot: true              # false=有监督；true=零样本对比
   add_fuse: false               # 是否融合 enc+dec 特征
 
   enc_steps: 32                 # OadTransformer Encoder 历史帧窗口大小

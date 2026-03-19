@@ -29,9 +29,11 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import logging
 import os
 import random
+import shutil
 from pathlib import Path
 from typing import Any, Optional
 
@@ -53,7 +55,7 @@ from ovoad.utils import (
     save_training_state,
     setup_logging,
 )
-from utils.arg_parser import build_two_stage_parser
+from ovoad.utils.arg_parser import build_two_stage_parser
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,7 @@ logger = logging.getLogger(__name__)
 # ────────────────────────────────────────────────────────────────────
 # 配置管理
 # ────────────────────────────────────────────────────────────────────
+
 
 def _add_train_extra_args(parser: argparse.ArgumentParser) -> None:
     """注册训练脚本专属的额外 CLI 参数（不属于 config 嵌套结构）。
@@ -108,6 +111,22 @@ def _add_train_extra_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def flatten_config(cfg, prefix=""):
+    """将嵌套字典转为扁平字典，并将列表转为字符串"""
+    items = {}
+    for k, v in cfg.items():
+        new_key = f"{prefix}{k}" if prefix == "" else f"{prefix}/{k}"
+        if isinstance(v, dict):
+            items.update(flatten_config(v, new_key))
+        elif isinstance(v, (list, tuple)):
+            items[new_key] = str(v)  # 将 [0.9, 0.999] 转为 "[0.9, 0.999]"
+        elif v is None:
+            items[new_key] = "None"
+        else:
+            items[new_key] = v
+    return items
+
+
 def make_run_dir(output_root: str | Path, tag: str = "") -> Path:
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     name = f"run_{ts}" + (f"_{tag}" if tag else "")
@@ -116,10 +135,10 @@ def make_run_dir(output_root: str | Path, tag: str = "") -> Path:
     return run_dir
 
 
-
 # ────────────────────────────────────────────────────────────────────
 # 优化器 & 调度器
 # ────────────────────────────────────────────────────────────────────
+
 
 def build_optimizer(
     model: torch.nn.Module,
@@ -138,7 +157,7 @@ def build_optimizer(
             decay.append(param)
 
     param_groups = [
-        {"params": decay,    "weight_decay": weight_decay},
+        {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
 
@@ -162,16 +181,20 @@ def build_scheduler(
 ) -> torch.optim.lr_scheduler.LRScheduler:
     """构建学习率调度器。"""
     if scheduler_type == "cosine":
+
         def lr_lambda(step: int) -> float:
             if step < warmup_steps:
                 return step / max(warmup_steps, 1)
             progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
             return max(min_lr_ratio, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     elif scheduler_type == "linear":
         return torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1.0, end_factor=min_lr_ratio,
+            optimizer,
+            start_factor=1.0,
+            end_factor=min_lr_ratio,
             total_iters=total_steps,
         )
     elif scheduler_type == "onecycle":
@@ -189,6 +212,7 @@ def build_scheduler(
 # 验证
 # ────────────────────────────────────────────────────────────────────
 
+
 @torch.no_grad()
 def validate(
     accelerator: Accelerator,
@@ -202,23 +226,23 @@ def validate(
     model.eval()
     num_classes = len(class_names)
 
-    all_probs:  list[torch.Tensor] = []
+    all_probs: list[torch.Tensor] = []
     all_labels: list[torch.Tensor] = []
 
     for batch in loader:
-        rgb        = batch["rgb"]          # [B, T, D]，accelerate 已移到正确设备
-        enc_target = batch["enc_target"]   # [B, T]
+        rgb = batch["rgb"]  # [B, T, D]，accelerate 已移到正确设备
+        enc_target = batch["enc_target"]  # [B, T]
 
         outputs = model(image=rgb, text=None)
         # 有监督推理输出：[B, 1+dec_q, num_classes]，取 index=0（encoder 全局预测）
         if isinstance(outputs, dict):
             pred_logits = torch.zeros(rgb.shape[0], num_classes, device=rgb.device)
         elif outputs.dim() == 3:
-            pred_logits = outputs[:, 0, :]      # [B, num_classes]
+            pred_logits = outputs[:, 0, :]  # [B, num_classes]
         else:
             pred_logits = outputs
 
-        pred_probs = torch.softmax(pred_logits, dim=-1)   # [B, num_classes]
+        pred_probs = torch.softmax(pred_logits, dim=-1)  # [B, num_classes]
 
         last_label = enc_target[:, -1].clamp(0, num_classes - 1)
         one_hot = F.one_hot(last_label, num_classes=num_classes).float()  # [B, C]
@@ -228,17 +252,17 @@ def validate(
         all_probs.append(pred_probs.cpu())
         all_labels.append(one_hot.cpu())
 
-    probs_mat  = torch.cat(all_probs,  dim=0).numpy().T   # [C, N]
-    labels_mat = torch.cat(all_labels, dim=0).numpy().T   # [C, N]
+    probs_mat = torch.cat(all_probs, dim=0).numpy().T  # [C, N]
+    labels_mat = torch.cat(all_labels, dim=0).numpy().T  # [C, N]
 
     map_result = frame_level_map(probs_mat, labels_mat, with_bg=False)
     mAP = map_result["map"] * 100
     cAP = map_result["cap"] * 100
 
-    pred_cls  = np.argmax(probs_mat, axis=0)
+    pred_cls = np.argmax(probs_mat, axis=0)
     label_cls = np.argmax(labels_mat, axis=0)
     f1_result = compute_f1_per_class(pred_cls, label_cls, num_classes=num_classes)
-    macro_f1  = f1_result["macro_f1"] * 100
+    macro_f1 = f1_result["macro_f1"] * 100
 
     if accelerator.is_main_process:
         ap_arr = map_result["all_cls_ap"]
@@ -246,7 +270,9 @@ def validate(
             f"[Epoch {epoch}] mAP={mAP:.2f}%  cAP={cAP:.2f}%  macro-F1={macro_f1:.2f}%"
         )
         for i, ap in enumerate(ap_arr):
-            cls_name = class_names[i + 1] if i + 1 < len(class_names) else f"cls_{i+1}"
+            cls_name = (
+                class_names[i + 1] if i + 1 < len(class_names) else f"cls_{i + 1}"
+            )
             logger.info(f"  {cls_name}: AP={ap * 100:.2f}%")
 
         # accelerate 内置日志追踪（支持 TensorBoard / WandB）
@@ -262,6 +288,7 @@ def validate(
 # 主训练流程
 # ────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     # ── 两阶段参数解析 ────────────────────────────────────────────
     # 第一阶段：解析 --config，加载 YAML 作为默认值基准
@@ -276,10 +303,10 @@ def main() -> None:
     )
 
     train_cfg = cfg["train"]
-    data_cfg  = cfg["data"]
+    data_cfg = cfg["data"]
     model_cfg = cfg["model"]
-    ckpt_cfg  = cfg.get("checkpoint", {})
-    eval_cfg  = cfg.get("evaluate", {})
+    ckpt_cfg = cfg.get("checkpoint", {})
+    eval_cfg = cfg.get("evaluate", {})
 
     # ── 输出目录 ──────────────────────────────────────────────────
     output_root = cfg["output"]["dir"]
@@ -289,7 +316,7 @@ def main() -> None:
         run_dir = make_run_dir(output_root, tag=args.tag)
 
     ckpt_dir = run_dir / "checkpoints"
-    log_dir  = run_dir / "logs"
+    log_dir = run_dir / "logs"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Accelerator 初始化 ────────────────────────────────────────
@@ -297,14 +324,14 @@ def main() -> None:
     project_config = ProjectConfiguration(
         project_dir=str(run_dir),
         logging_dir=str(log_dir),
-        automatic_checkpoint_naming=True,     # 自动命名：step_<N>
-        total_limit=ckpt_cfg.get("keep", 5), # 最多保留 N 个 checkpoint
+        automatic_checkpoint_naming=False,  # 自动命名：step_<N>
+        total_limit=ckpt_cfg.get("keep", 5),  # 最多保留 N 个 checkpoint
     )
 
     accelerator = Accelerator(
-        mixed_precision=args.mixed_precision,                    # fp16 / bf16 / no
+        mixed_precision=args.mixed_precision,  # fp16 / bf16 / no
         gradient_accumulation_steps=train_cfg.get("accum_steps", 1),
-        log_with="tensorboard",                                   # 内置 TensorBoard 追踪
+        log_with="tensorboard",  # 内置 TensorBoard 追踪
         project_config=project_config,
     )
 
@@ -313,13 +340,16 @@ def main() -> None:
 
     if accelerator.is_main_process:
         logger.info(f"运行目录: {run_dir}")
-        logger.info(f"进程数: {accelerator.num_processes}  混合精度: {args.mixed_precision}")
+        logger.info(
+            f"进程数: {accelerator.num_processes}  混合精度: {args.mixed_precision}"
+        )
         # 保存配置快照
         with open(run_dir / "config.yml", "w", encoding="utf-8") as f:
             yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+
         accelerator.init_trackers(
             project_name="ovoad",
-            config=cfg,
+            config=flatten_config(cfg),
             init_kwargs={"tensorboard": {"flush_secs": 30}},
         )
 
@@ -349,7 +379,7 @@ def main() -> None:
     )
 
     class_names = train_loader.dataset.class_names
-    num_classes  = len(class_names)
+    num_classes = len(class_names)
 
     if accelerator.is_main_process:
         logger.info(
@@ -359,7 +389,10 @@ def main() -> None:
 
     # ── 模型构建 ──────────────────────────────────────────────────
     import clip as clip_lib
-    clip_model, _ = clip_lib.load(model_cfg.get("clip_backbone", "ViT-B/32"), device="cpu")
+
+    clip_model, _ = clip_lib.load(
+        model_cfg.get("clip_backbone", "ViT-B/32"), device="cpu"
+    )
 
     model = build_model(
         clip_model=clip_model,
@@ -388,9 +421,9 @@ def main() -> None:
         weight_decay=train_cfg.get("weight_decay", 0.01),
     )
 
-    total_steps   = train_cfg["epochs"] * len(train_loader)
-    warmup_steps  = train_cfg.get("warmup_epochs", 2) * len(train_loader)
-    min_lr_ratio  = train_cfg.get("min_lr", 1e-6) / train_cfg["lr"]
+    total_steps = train_cfg["epochs"] * len(train_loader)
+    warmup_steps = train_cfg.get("warmup_epochs", 2) * len(train_loader)
+    min_lr_ratio = train_cfg.get("min_lr", 1e-6) / train_cfg["lr"]
 
     scheduler = build_scheduler(
         optimizer=optimizer,
@@ -409,8 +442,8 @@ def main() -> None:
     # ── Checkpoint 恢复 ───────────────────────────────────────────
     # accelerate.load_state 自动恢复：模型权重、优化器状态、
     # 调度器状态、RNG 状态（Python/NumPy/PyTorch/CUDA）
-    start_epoch  = 0
-    global_step  = 0
+    start_epoch = 0
+    global_step = 0
     best_metrics = {"map": 0.0, "cap": 0.0, "macro_f1": 0.0}
 
     resume_path: Optional[Path] = None
@@ -427,9 +460,10 @@ def main() -> None:
         state_file = resume_path / "training_state.json"
         if state_file.exists():
             import json
+
             state = json.loads(state_file.read_text())
-            start_epoch  = state.get("epoch", 0) + 1
-            global_step  = state.get("step", 0)
+            start_epoch = state.get("epoch", 0) + 1
+            global_step = state.get("step", 0)
             best_metrics = state.get("best_metrics", best_metrics)
         if accelerator.is_main_process:
             logger.info(
@@ -439,8 +473,12 @@ def main() -> None:
     # ── 仅评估模式 ────────────────────────────────────────────────
     if args.eval_only:
         val_metrics = validate(
-            accelerator, model, val_loader, class_names,
-            epoch=0, global_step=0,
+            accelerator,
+            model,
+            val_loader,
+            class_names,
+            epoch=0,
+            global_step=0,
         )
         if accelerator.is_main_process:
             logger.info(f"评估完成: {val_metrics}")
@@ -449,12 +487,12 @@ def main() -> None:
 
     # ── 训练循环 ──────────────────────────────────────────────────
     total_epochs = train_cfg["epochs"]
-    eval_freq    = eval_cfg.get("eval_freq", 5)
-    save_freq    = ckpt_cfg.get("save_freq", 5)
-    clip_grad    = train_cfg.get("clip_grad", 5.0)
-    print_freq   = cfg.get("print_freq", 50)
-    debug        = args.debug
-    zero_shot    = model_cfg.get("zero_shot", False)   # 提前确定，避免每 step 重复查询
+    eval_freq = eval_cfg.get("eval_freq", 5)
+    save_freq = ckpt_cfg.get("save_freq", 5)
+    clip_grad = train_cfg.get("clip_grad", 5.0)
+    print_freq = cfg.get("print_freq", 50)
+    debug = args.debug
+    zero_shot = model_cfg.get("zero_shot", False)  # 提前确定，避免每 step 重复查询
 
     if accelerator.is_main_process:
         logger.info(f"开始训练：epoch {start_epoch} → {total_epochs - 1}")
@@ -467,14 +505,14 @@ def main() -> None:
             train_loader.sampler.set_epoch(epoch)
 
         loss_meter = AverageMeter("loss")
-        enc_meter  = AverageMeter("loss_enc")
-        dec_meter  = AverageMeter("loss_dec")
+        enc_meter = AverageMeter("loss_enc")
+        dec_meter = AverageMeter("loss_dec")
 
         for step, batch in enumerate(train_loader):
             # accelerate 的梯度累积上下文管理器：
             # 在累积步内自动跳过 all_reduce，最后一步才同步梯度
             with accelerator.accumulate(model):
-                rgb        = batch["rgb"]
+                rgb = batch["rgb"]
                 enc_target = batch["enc_target"]
                 dec_target = batch["dec_target"]
                 B = rgb.shape[0]
@@ -483,13 +521,17 @@ def main() -> None:
                 #                 text shape [B, 1+dec_steps, 77]
                 # zero_shot=False：传入有监督标注 (enc_target, dec_target)
                 if zero_shot:
-                    text_input = batch["text"]           # [B, 1+dec_q, 77]
+                    text_input = batch["text"]  # [B, 1+dec_q, 77]
                 else:
                     text_input = (enc_target, dec_target)
 
                 losses = model(image=rgb, text=text_input)
-                loss_enc = losses.get("loss_enc_vtc", torch.tensor(0.0, device=rgb.device))
-                loss_dec = losses.get("loss_dec_vtc", torch.tensor(0.0, device=rgb.device))
+                loss_enc = losses.get(
+                    "loss_enc_vtc", torch.tensor(0.0, device=rgb.device)
+                )
+                loss_dec = losses.get(
+                    "loss_dec_vtc", torch.tensor(0.0, device=rgb.device)
+                )
                 total_loss = loss_enc + loss_dec
 
                 # accelerate 处理 AMP scaler，只需调用 backward
@@ -512,22 +554,23 @@ def main() -> None:
 
                 # 跨进程规约 loss（用于准确记录）
                 loss_reduced = accelerator.reduce(total_loss, reduction="mean")
-                enc_reduced  = accelerator.reduce(loss_enc,  reduction="mean")
-                dec_reduced  = accelerator.reduce(loss_dec,  reduction="mean")
+                enc_reduced = accelerator.reduce(loss_enc, reduction="mean")
+                dec_reduced = accelerator.reduce(loss_dec, reduction="mean")
 
                 loss_meter.update(loss_reduced.item(), B)
-                enc_meter.update(enc_reduced.item(),   B)
-                dec_meter.update(dec_reduced.item(),   B)
+                enc_meter.update(enc_reduced.item(), B)
+                dec_meter.update(dec_reduced.item(), B)
 
                 if accelerator.is_main_process:
                     # accelerate 内置日志（同时写 TensorBoard）
                     accelerator.log(
                         {
                             "train/total_loss": loss_meter.avg,
-                            "train/loss_enc":   enc_meter.avg,
-                            "train/loss_dec":   dec_meter.avg,
+                            "train/loss_enc": enc_meter.avg,
+                            "train/loss_dec": dec_meter.avg,
                             "train/lr": optimizer.param_groups[0]["lr"],
-                            "sys/gpu_mem_mb": torch.cuda.max_memory_allocated() / 1024 ** 2,
+                            "sys/gpu_mem_mb": torch.cuda.max_memory_allocated()
+                            / 1024**2,
                         },
                         step=global_step,
                     )
@@ -553,8 +596,12 @@ def main() -> None:
         is_last = epoch == total_epochs - 1
         if epoch % eval_freq == 0 or is_last:
             val_metrics = validate(
-                accelerator, model, val_loader, class_names,
-                epoch=epoch, global_step=global_step,
+                accelerator,
+                model,
+                val_loader,
+                class_names,
+                epoch=epoch,
+                global_step=global_step,
             )
             is_best = val_metrics["map"] > best_metrics["map"]
             if is_best:
@@ -569,14 +616,16 @@ def main() -> None:
         #   - 自定义注册对象（通过 register_for_checkpointing）
         if epoch % save_freq == 0 or is_last:
             ckpt_save_dir = ckpt_dir / f"step_{global_step:07d}"
+            ckpt_save_dir.mkdir(parents=True, exist_ok=True)
             accelerator.save_state(str(ckpt_save_dir))
 
             # 额外保存训练进度（epoch、step、best_metrics），供续训使用
             if accelerator.is_main_process:
                 import json
+
                 state = {
-                    "epoch":        epoch,
-                    "step":         global_step,
+                    "epoch": epoch,
+                    "step": global_step,
                     "best_metrics": best_metrics,
                 }
                 (ckpt_save_dir / "training_state.json").write_text(
@@ -587,8 +636,8 @@ def main() -> None:
                 # 若为最优模型，额外硬链接一份 best_map
                 best_dir = ckpt_dir / "best_map"
                 if is_best and epoch % eval_freq == 0:
+                    best_dir.parent.mkdir(parents=True, exist_ok=True)
                     if best_dir.exists():
-                        import shutil
                         shutil.rmtree(best_dir)
                     shutil.copytree(ckpt_save_dir, best_dir)
                     logger.info(f"最优 mAP={best_metrics['map']:.2f}% → {best_dir}")
