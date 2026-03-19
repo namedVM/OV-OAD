@@ -18,10 +18,10 @@ from einops import rearrange
 
 from .oad_transformer import OadTransformer
 
-
 # ────────────────────────────────────────────────────────────────────
 # 分布式工具
 # ────────────────────────────────────────────────────────────────────
+
 
 def dist_collect(x: torch.Tensor) -> torch.Tensor:
     """在所有 GPU 上收集 tensor，拼接后返回。
@@ -48,7 +48,9 @@ class GatherLayer(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx: torch.autograd.function.FunctionCtx, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx, x: torch.Tensor
+    ) -> torch.Tensor:  # type: ignore[override]
         world_size = dist.get_world_size()
         out_list = [torch.zeros_like(x) for _ in range(world_size)]
         dist.all_gather(out_list, x.contiguous())
@@ -58,7 +60,9 @@ class GatherLayer(torch.autograd.Function):
         return torch.cat(out_list, dim=0)
 
     @staticmethod
-    def backward(ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> torch.Tensor:  # type: ignore[override]
         (rank,) = ctx.saved_tensors
         batch_size = grad_output.shape[0] // ctx.world_size
         # 取出本进程对应的梯度段
@@ -68,6 +72,7 @@ class GatherLayer(torch.autograd.Function):
 # ────────────────────────────────────────────────────────────────────
 # 文本编码器（CLIP 文本分支）
 # ────────────────────────────────────────────────────────────────────
+
 
 class TextEncoder(nn.Module):
     """CLIP 文本编码器包装器。
@@ -94,11 +99,11 @@ class TextEncoder(nn.Module):
         Returns:
             文本特征 [B, text_dim]
         """
-        x = self.token_embedding(text).type(self.dtype)         # [B, L, d_model]
+        x = self.token_embedding(text).type(self.dtype)  # [B, L, d_model]
         x = x + self.positional_embedding.type(self.dtype)
-        x = x.permute(1, 0, 2)    # NLD -> LND（CLIP Transformer 的约定）
+        x = x.permute(1, 0, 2)  # NLD -> LND（CLIP Transformer 的约定）
         x = self.transformer(x)
-        x = x.permute(1, 0, 2)    # LND -> NLD
+        x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
         # 取 EOT（序列中 token 值最大的位置）对应的特征并投影
@@ -109,6 +114,7 @@ class TextEncoder(nn.Module):
 # ────────────────────────────────────────────────────────────────────
 # 主模型：ZsOadCLIP
 # ────────────────────────────────────────────────────────────────────
+
 
 class ZsOadCLIP(nn.Module):
     """零样本在线动作检测模型（Zero-Shot Online Action Detection with CLIP）。
@@ -202,7 +208,7 @@ class ZsOadCLIP(nn.Module):
         if self.read_from == "png":
             # 原始图像路径：先通过 CLIP 图像编码器提取帧特征
             b, t, c, h, w = image.size()
-            image = image.reshape(-1, c, h, w)        # [B*T, C, H, W]
+            image = image.reshape(-1, c, h, w)  # [B*T, C, H, W]
             image_features = self.img_encoder(image)  # [B*T, D]
             image_features = image_features.view(b, t, -1)  # [B, T, D]
             inputs = (image_features, None)
@@ -260,13 +266,13 @@ class ZsOadCLIP(nn.Module):
         text_x = F.normalize(text_x, dim=-1)
 
         # 收集全局特征
-        all_text_x = dist_collect(text_x)   # [world_size*B, D]
+        all_text_x = dist_collect(text_x)  # [world_size*B, D]
         all_image_x = dist_collect(image_x)  # [world_size*B, D]
 
         # 缩放余弦相似度
         logit_scale = torch.clamp(self.logit_scale.exp(), max=100)
-        logits_per_img = image_x @ all_text_x.t() * logit_scale    # [B, world*B]
-        logits_per_text = text_x @ all_image_x.t() * logit_scale   # [B, world*B]
+        logits_per_img = image_x @ all_text_x.t() * logit_scale  # [B, world*B]
+        logits_per_text = text_x @ all_image_x.t() * logit_scale  # [B, world*B]
 
         # 对称交叉熵
         loss_img = self.cross_entropy(logits_per_img, labels)
@@ -305,7 +311,9 @@ class ZsOadCLIP(nn.Module):
         # 当前帧（enc 窗口最后一帧）作为 encoder 监督信号
         current_label = enc_target[:, -1]  # [B]
         enc_target_oh = torch.zeros(B, num_class, device=image.device)
-        enc_target_oh.scatter_(1, current_label.unsqueeze(1).clamp(0, num_class - 1), 1.0)
+        enc_target_oh.scatter_(
+            1, current_label.unsqueeze(1).clamp(0, num_class - 1), 1.0
+        )
 
         # decoder 预测帧的 one-hot 标注
         dec_steps = dec_target.shape[1]
@@ -339,14 +347,14 @@ class ZsOadCLIP(nn.Module):
         image_outs = self.encode_image(image)  # [B, 1+dec_q, D]
 
         # 分离 encoder 输出（全局）和 decoder 输出（逐帧）
-        image_enc = image_outs[:, 0, :]                              # [B, D]
+        image_enc = image_outs[:, 0, :]  # [B, D]
         image_dec = rearrange(image_outs[:, 1:, :], "b l c -> (b l) c")  # [B*dec_q, D]
 
         # 文本编码：enc 侧取第 0 个 token，dec 侧展平后分别编码
-        text_enc = self.encode_text(text[:, 0, :])                   # [B, D]
+        text_enc = self.encode_text(text[:, 0, :])  # [B, D]
         text_dec = self.encode_text(
-            rearrange(text[:, 1:, :], "b l c -> (b l) c")           # [B*dec_q, 77]
-        )                                                            # [B*dec_q, D]
+            rearrange(text[:, 1:, :], "b l c -> (b l) c")  # [B*dec_q, 77]
+        )  # [B*dec_q, D]
 
         # 计算对比损失
         loss_enc = self.vtc_loss(image_enc, text_enc) * self.loss_weight_enc
@@ -390,8 +398,9 @@ class ZsOadCLIP(nn.Module):
         if self.training:
             if not self.zero_shot:
                 # 有监督训练
-                assert isinstance(text, tuple) and len(text) == 2, \
+                assert isinstance(text, tuple) and len(text) == 2, (
                     "有监督训练需要传入 (enc_target, dec_target) 元组"
+                )
                 enc_target, dec_target = text
                 return self.forward_train_supervised(image, enc_target, dec_target)
             else:
@@ -416,13 +425,16 @@ class ZsOadCLIP(nn.Module):
         image_features = self.encode_image(image)  # [B, 1+dec_q, D]
         image_features = F.normalize(image_features, dim=-1)
         # 余弦相似度 × 温度缩放
-        logits = self.logit_scale.exp() * image_features @ text_weights  # [B, 1+dec_q, num_class]
+        logits = (
+            self.logit_scale.exp() * image_features @ text_weights
+        )  # [B, 1+dec_q, num_class]
         return logits
 
 
 # ────────────────────────────────────────────────────────────────────
 # 模型构建工厂函数
 # ────────────────────────────────────────────────────────────────────
+
 
 def build_model(
     clip_model: nn.Module,
@@ -452,9 +464,9 @@ def build_model(
         add_fuse: 是否融合特征
         freeze_mode: 参数冻结策略
             "none"  — 仅训练 OadTransformer
-            "both"  — 训练所有参数
-            "image" — 仅训练图像编码器
-            "text"  — 仅训练文本编码器
+            "both"  — 全量微调（含 OadTransformer + CLIP 两支）
+            "image" — 仅微调图像编码器 + OadTransformer
+            "text"  — 仅微调文本编码器 + OadTransformer
         loss_weight_enc: Encoder 损失权重
         loss_weight_dec: Decoder 损失权重
 
@@ -475,25 +487,39 @@ def build_model(
         loss_weight_dec=loss_weight_dec,
     )
 
-    # 设置梯度冻结策略
-    if freeze_mode == "none":
-        # 默认：只训练 OadTransformer，冻结 CLIP backbone
-        for name, param in model.named_parameters():
-            param.requires_grad_(name.startswith("oad_encoder_decoder"))
-    elif freeze_mode == "both":
-        # 全量微调
-        for param in model.parameters():
+    # 1. 初始状态：全部冻结
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    # 2. 根据 freeze_mode 开启特定部分的梯度
+    # OadTransformer (oad_encoder_decoder) 始终开启，除非 freeze_mode 特殊指定（当前业务逻辑下必选）
+    for name, param in model.named_parameters():
+        if name.startswith("oad_encoder_decoder"):
             param.requires_grad_(True)
+
+    if freeze_mode == "both":
+        model.text_encoder.requires_grad_(True)
+        model.img_encoder.requires_grad_(True)
+        model.logit_scale.requires_grad = True
     elif freeze_mode == "image":
-        # 仅微调图像编码器
-        for name, param in model.named_parameters():
-            param.requires_grad_(name.startswith("img_encoder"))
+        model.img_encoder.requires_grad_(True)
     elif freeze_mode == "text":
-        # 仅微调文本编码器
-        for name, param in model.named_parameters():
-            param.requires_grad_(name.startswith("text_encoder"))
+        model.text_encoder.requires_grad_(True)
+        model.logit_scale.requires_grad = True
+    elif freeze_mode == "none":
+        pass  # 仅保留 oad_encoder_decoder 的梯度
     else:
         raise ValueError(f"未知的 freeze_mode: {freeze_mode}")
+
+    # 3. 强制性分支修正（针对 Zero-Shot 逻辑）
+    # 如果是非 zero-shot 模式（有监督模式），文本分支根本不参与计算，必须彻底冻结
+    if not zero_shot:
+        model.text_encoder.requires_grad_(False)
+        model.logit_scale.requires_grad = False
+
+    # 如果 read_from == "feat"，img_encoder 是 nn.Identity，没有参数，但也需确保其不可训练
+    if read_from == "feat":
+        model.img_encoder.requires_grad_(False)
 
     # 转为 float32（CLIP 默认 float16，训练时建议 float32）
     model.float()

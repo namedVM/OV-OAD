@@ -14,8 +14,8 @@ output:
 
 # ──────────────── 数据 ────────────────────
 data:
-  dir: ./data/features          # .pth 特征文件目录
-  metadata_csv: ./data/metadata.csv  # 类别元数据文件
+  dir: data/thumos14          # .pth 特征文件目录
+  metadata_csv: data/thumos14/meta.csv  # 类别元数据文件
 
   val_ratio: 0.1                # 验证集占全部视频比例
   nonzero_threshold: 0          # enc 窗口内非背景帧最低数量（0=不过滤）
@@ -60,7 +60,7 @@ model:
 # ──────────────── 训练 ────────────────────
 train:
   epochs: 30
-  batch_size: 32                # 每张 GPU 的 batch size
+  batch_size: 256                # 每张 GPU 的 batch size
 
   optimizer: "adamw"            # adamw | adam | sgd
   lr: 6.4e-5                    # 基础学习率（会随 world_size 线性缩放）
