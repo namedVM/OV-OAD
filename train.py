@@ -454,6 +454,7 @@ def main() -> None:
     clip_grad    = train_cfg.get("clip_grad", 5.0)
     print_freq   = cfg.get("print_freq", 50)
     debug        = args.debug
+    zero_shot    = model_cfg.get("zero_shot", False)   # 提前确定，避免每 step 重复查询
 
     if accelerator.is_main_process:
         logger.info(f"开始训练：epoch {start_epoch} → {total_epochs - 1}")
@@ -478,7 +479,15 @@ def main() -> None:
                 dec_target = batch["dec_target"]
                 B = rgb.shape[0]
 
-                losses = model(image=rgb, text=(enc_target, dec_target))
+                # zero_shot=True：传入 CLIP token（由 dataset 按 class_id 索引）
+                #                 text shape [B, 1+dec_steps, 77]
+                # zero_shot=False：传入有监督标注 (enc_target, dec_target)
+                if zero_shot:
+                    text_input = batch["text"]           # [B, 1+dec_q, 77]
+                else:
+                    text_input = (enc_target, dec_target)
+
+                losses = model(image=rgb, text=text_input)
                 loss_enc = losses.get("loss_enc_vtc", torch.tensor(0.0, device=rgb.device))
                 loss_dec = losses.get("loss_dec_vtc", torch.tensor(0.0, device=rgb.device))
                 total_loss = loss_enc + loss_dec

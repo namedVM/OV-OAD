@@ -245,12 +245,15 @@ class ZsOadCLIP(nn.Module):
         batch_size = image_x.shape[0]
 
         # 全局标签：每个样本在全局 batch 中的位置即为正样本 index
-        labels = (
-            torch.arange(batch_size, dtype=torch.long, device=image_x.device)
-            + batch_size * dist.get_rank()
-            if (dist.is_available() and dist.is_initialized())
-            else torch.arange(batch_size, dtype=torch.long, device=image_x.device)
-        )
+        # 注意：需显式加括号，避免 Python 运算符优先级（+ 高于 if-else）
+        # 导致单机时 labels 变成 tensor+tensor 而非期望的 arange
+        if dist.is_available() and dist.is_initialized():
+            labels = (
+                torch.arange(batch_size, dtype=torch.long, device=image_x.device)
+                + batch_size * dist.get_rank()
+            )
+        else:
+            labels = torch.arange(batch_size, dtype=torch.long, device=image_x.device)
 
         # L2 归一化
         image_x = F.normalize(image_x, dim=-1)

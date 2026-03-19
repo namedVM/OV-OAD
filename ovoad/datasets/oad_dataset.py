@@ -36,31 +36,45 @@ from torch.utils.data.distributed import DistributedSampler
 # 元数据读取
 # ────────────────────────────────────────────────────────────────────
 
-def load_metadata(csv_path: str | Path) -> tuple[dict[int, str], list[str]]:
-    """读取 metadata.csv，返回 id→action 映射和有序类别名列表。
+def load_metadata(
+    csv_path: str | Path,
+) -> tuple[dict[int, str], list[str], list[str]]:
+    """读取 metadata.csv，返回 id→action 映射、有序类别名列表、有序文本描述列表。
+
+    CSV 须包含 'id' 和 'action' 两列；若存在 'text' 列则优先用其作为
+    CLIP 文本描述（支持更丰富的自然语言 prompt），否则回退到 'action'。
 
     Args:
         csv_path: metadata.csv 路径
 
     Returns:
-        id2action: {id: action_name}，id=0 为背景
+        id2action:   {id: action_name}，id=0 为背景
         class_names: 按 id 排序的类别名列表（index 即 id）
+        class_texts: 按 id 排序的 CLIP 文本描述列表（用于 tokenize）
     """
     id2action: dict[int, str] = {}
+    id2text:   dict[int, str] = {}
+
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        has_text_col = "text" in fieldnames
         for row in reader:
-            action_id = int(row["id"])
+            action_id   = int(row["id"])
             action_name = row["action"].strip()
             id2action[action_id] = action_name
+            # "text" 列优先，不存在则回退到 "action"
+            id2text[action_id] = row["text"].strip() if has_text_col else action_name
 
-    # 按 id 排序确保 class_names[i] 对应 id=i
+    # 按 id 排序确保 class_names[i] / class_texts[i] 对应 id=i
     max_id = max(id2action.keys())
     class_names: list[str] = []
+    class_texts: list[str] = []
     for i in range(max_id + 1):
         class_names.append(id2action.get(i, f"class_{i}"))
+        class_texts.append(id2text.get(i, id2action.get(i, f"class_{i}")))
 
-    return id2action, class_names
+    return id2action, class_names, class_texts
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -117,10 +131,15 @@ class OadFeatureDataset(Dataset):
         self.stride = stride
         self.bg_weight = bg_weight
 
-        # 读取类别信息
-        self.id2action, self.class_names = load_metadata(self.metadata_csv)
+        # 读取类别信息（含 text 描述）
+        self.id2action, self.class_names, class_texts = load_metadata(self.metadata_csv)
         self.num_classes = len(self.class_names)
         self.bg_class_id = 0  # id=0 保留为背景
+
+        # 预 tokenize 所有类别文本描述，shape [num_classes, context_length(77)]
+        # 延迟导入避免循环依赖；tokenize 返回 LongTensor
+        import clip as _clip
+        self.text_tokens: torch.Tensor = _clip.tokenize(class_texts)  # [C, 77]
 
         # 扫描所有 .pth 文件并按 train/val 划分
         all_pth_files = sorted(self.data_dir.glob("*.pth"))
@@ -296,10 +315,13 @@ class OadFeatureDataset(Dataset):
 
         Returns:
             dict with:
-                'rgb':        [enc_steps, D]      — encoder 输入特征
-                'enc_target': [enc_steps]          — encoder 帧级类别标注
-                'dec_target': [dec_steps]          — decoder 预测帧标注
-                'mask':       [enc_steps]          — 有效帧掩码（全 1，padding 由 collate 处理）
+                'rgb':        [enc_steps, D]          — encoder 输入特征
+                'enc_target': [enc_steps]              — encoder 帧级类别标注
+                'dec_target': [dec_steps]              — decoder 预测帧标注
+                'mask':       [enc_steps]              — 有效帧掩码（全 1）
+                'text':       [1+dec_steps, 77]        — CLIP token：
+                                                          index 0   → encoder 当前帧（最后帧）文本
+                                                          index 1:  → decoder 各预测帧文本
         """
         stem, start, end = self.samples[index]
 
@@ -310,15 +332,28 @@ class OadFeatureDataset(Dataset):
             stem2file = {f.stem: f for f in self.pth_files}
             rgb, anno = self._get_or_load(stem, stem2file[stem])
 
-        enc_rgb = rgb[start:end].clone()         # [enc_steps, D]
-        enc_anno = anno[start:end].clone()        # [enc_steps]
-        dec_anno = anno[end: end + self.dec_steps].clone()  # [dec_steps]
+        enc_rgb  = rgb[start:end].clone()                    # [enc_steps, D]
+        enc_anno = anno[start:end].clone()                   # [enc_steps]
+        dec_anno = anno[end: end + self.dec_steps].clone()   # [dec_steps]
+
+        # ── 文本 token（按 class_id 索引预 tokenize 表）──────────────
+        # encoder 侧：取窗口最后一帧（当前帧）的类别文本
+        enc_cls   = enc_anno[-1].clamp(0, self.num_classes - 1).item()
+        enc_text  = self.text_tokens[enc_cls]                # [77]
+
+        # decoder 侧：取各预测帧对应的类别文本
+        dec_cls_ids = dec_anno.clamp(0, self.num_classes - 1)   # [dec_steps]
+        dec_text    = self.text_tokens[dec_cls_ids]              # [dec_steps, 77]
+
+        # 拼合：[1+dec_steps, 77]
+        text = torch.cat([enc_text.unsqueeze(0), dec_text], dim=0)
 
         return {
-            "rgb": enc_rgb,          # [T, D]
-            "enc_target": enc_anno,  # [T] 逐帧类别 id
-            "dec_target": dec_anno,  # [dec_steps] 逐帧类别 id
-            "mask": torch.ones(self.enc_steps, dtype=torch.bool),  # 全有效
+            "rgb":        enc_rgb,                                            # [enc_steps, D]
+            "enc_target": enc_anno,                                           # [enc_steps]
+            "dec_target": dec_anno,                                           # [dec_steps]
+            "mask":       torch.ones(self.enc_steps, dtype=torch.bool),      # [enc_steps]
+            "text":       text,                                               # [1+dec_steps, 77]
         }
 
 
@@ -331,6 +366,7 @@ def collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
 
     当 batch 内序列长度不一致时（如使用变长窗口），
     对 rgb 做 zero-padding，mask 标记有效位置。
+    text 字段（[1+dec_steps, 77]）长度固定，直接 stack。
 
     Args:
         batch: list of sample dicts
@@ -341,7 +377,7 @@ def collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     max_enc = max(s["rgb"].shape[0] for s in batch)
     max_dec = max(s["dec_target"].shape[0] for s in batch)
 
-    rgb_list, enc_tgt_list, dec_tgt_list, mask_list = [], [], [], []
+    rgb_list, enc_tgt_list, dec_tgt_list, mask_list, text_list = [], [], [], [], []
 
     for s in batch:
         T, D = s["rgb"].shape
@@ -349,28 +385,33 @@ def collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
 
         if pad_len > 0:
             # 零填充
-            rgb_padded = F.pad(s["rgb"], (0, 0, 0, pad_len))  # [max_enc, D]
+            rgb_padded     = F.pad(s["rgb"], (0, 0, 0, pad_len))       # [max_enc, D]
             enc_tgt_padded = F.pad(s["enc_target"], (0, pad_len), value=0)
             mask = torch.cat([s["mask"], torch.zeros(pad_len, dtype=torch.bool)])
         else:
-            rgb_padded = s["rgb"]
+            rgb_padded     = s["rgb"]
             enc_tgt_padded = s["enc_target"]
             mask = s["mask"]
 
         # dec_target padding
         dec_pad = max_dec - s["dec_target"].shape[0]
-        dec_tgt_padded = F.pad(s["dec_target"], (0, dec_pad), value=0) if dec_pad > 0 else s["dec_target"]
+        dec_tgt_padded = (
+            F.pad(s["dec_target"], (0, dec_pad), value=0) if dec_pad > 0 else s["dec_target"]
+        )
 
         rgb_list.append(rgb_padded)
         enc_tgt_list.append(enc_tgt_padded)
         dec_tgt_list.append(dec_tgt_padded)
         mask_list.append(mask)
+        # text: [1+dec_steps, 77]，长度固定，直接收集
+        text_list.append(s["text"])
 
     return {
-        "rgb": torch.stack(rgb_list),           # [B, max_enc, D]
-        "enc_target": torch.stack(enc_tgt_list),  # [B, max_enc]
-        "dec_target": torch.stack(dec_tgt_list),  # [B, max_dec]
-        "mask": torch.stack(mask_list),           # [B, max_enc]
+        "rgb":        torch.stack(rgb_list),             # [B, max_enc, D]
+        "enc_target": torch.stack(enc_tgt_list),         # [B, max_enc]
+        "dec_target": torch.stack(dec_tgt_list),         # [B, max_dec]
+        "mask":       torch.stack(mask_list),            # [B, max_enc]
+        "text":       torch.stack(text_list),            # [B, 1+dec_steps, 77]
     }
 
 

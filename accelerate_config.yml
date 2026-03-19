@@ -7,10 +7,23 @@
 #
 # 或者先运行交互式向导生成配置（会覆盖本文件）：
 #   accelerate config
+#
+# ── 单卡（无 NCCL，无多进程）快速启动 ─────────────────────────────────────
+#   方式一：直接 python，accelerate 不介入分布式
+#     python train.py --config configs/train.yml --mixed-precision no
+#
+#   方式二：用 accelerate launch 但指定单卡配置文件
+#     accelerate launch --config_file accelerate_config_single.yml train.py \
+#         --config configs/train.yml
 # ─────────────────────────────────────────────────────────────────────────────
 
 compute_environment: LOCAL_MACHINE
-distributed_type: MULTI_GPU          # 单机多卡 DDP；单卡改为 NO
+
+# distributed_type 可选值：
+#   NO        — 单进程单卡，完全不初始化 torch.distributed / NCCL
+#   MULTI_GPU — 单机多卡 DDP（需要 NCCL）
+#   DEEPSPEED — DeepSpeed 分布式
+distributed_type: MULTI_GPU          # 多卡训练；单卡调试请改为 NO
 
 # ── GPU 设置 ──────────────────────────────────────────
 num_processes: 8                     # 使用的 GPU 数量（与 CUDA_VISIBLE_DEVICES 对应）
@@ -25,6 +38,7 @@ num_machines: 1                      # 单机训练保持 1
 # ── 混合精度 ──────────────────────────────────────────
 # 可选值：no / fp16 / bf16
 # bf16 需要 Ampere 及以上架构（A100/H100/4090 等）
+# 单卡调试时推荐改为 no，避免精度相关的额外变量
 mixed_precision: bf16
 
 # ── 其他 ──────────────────────────────────────────────
