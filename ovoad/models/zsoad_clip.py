@@ -139,6 +139,7 @@ class ZsOadCLIP(nn.Module):
         use_img_encoder: 是否在线提取图像特征（read_from=="png" 时为 True）
         loss_weight_enc: Encoder 损失权重
         loss_weight_dec: Decoder 损失权重
+        bg_class_id: 背景类 id（对比训练时跳过该类的样本，默认 0）
     """
 
     def __init__(
@@ -155,16 +156,21 @@ class ZsOadCLIP(nn.Module):
         use_img_encoder: bool = False,
         loss_weight_enc: float = 1.0,
         loss_weight_dec: float = 1.0,
+        bg_class_id: int = 0,
     ) -> None:
         super().__init__()
 
         self.zero_shot = zero_shot
         self.read_from = read_from
+        self.bg_class_id = bg_class_id
 
         # ── 文本编码器（复用 CLIP 文本分支）────────────────────────
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale  # 可学习温度参数
         self.dtype = clip_model.dtype
+
+        # CLIP 文本投影维度（从 text_projection 权重推断）
+        clip_embed_dim: int = clip_model.text_projection.shape[1]
 
         # ── 图像编码器（可选：在线提取特征时使用）─────────────────
         if use_img_encoder or read_from == "png":
@@ -180,6 +186,7 @@ class ZsOadCLIP(nn.Module):
             decoder_query_frames=decoder_query_frames,
             encoder_layers=encoder_layers,
             decoder_layers=decoder_layers,
+            clip_embed_dim=clip_embed_dim,
             zero_shot=zero_shot,
             add_fuse=add_fuse,
             loss_weight_enc=loss_weight_enc,
@@ -331,7 +338,10 @@ class ZsOadCLIP(nn.Module):
         return losses
 
     def forward_train_contrastive(
-        self, image: torch.Tensor, text: torch.Tensor
+        self,
+        image: torch.Tensor,
+        text: torch.Tensor,
+        enc_target: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """零样本对比预训练（VTC 损失）。
 
@@ -340,6 +350,9 @@ class ZsOadCLIP(nn.Module):
             text: [B, 1+dec_q, context_length]
                   text[:, 0, :] 对应 encoder 全局帧文本
                   text[:, 1:, :] 对应 decoder 查询帧文本
+            enc_target: [B, T] 逐帧类别标注，用于过滤背景帧（可选）。
+                        若提供，当前帧为背景（enc_target[:, -1] == bg_class_id）
+                        的样本将从 encoder 侧对比损失中剔除。
 
         Returns:
             {'loss_enc_vtc': ..., 'loss_dec_vtc': ...}
@@ -356,8 +369,22 @@ class ZsOadCLIP(nn.Module):
             rearrange(text[:, 1:, :], "b l c -> (b l) c")  # [B*dec_q, 77]
         )  # [B*dec_q, D]
 
-        # 计算对比损失
-        loss_enc = self.vtc_loss(image_enc, text_enc) * self.loss_weight_enc
+        # ── Encoder 侧：过滤背景帧，只对前景帧计算对比损失 ──────────
+        # 背景帧的视觉特征与 "background" 文本对齐意义不大，且会干扰前景学习
+        if enc_target is not None:
+            current_labels = enc_target[:, -1]  # [B] 取窗口最后一帧（当前帧）类别
+            fg_mask = current_labels != self.bg_class_id  # [B] bool
+            if fg_mask.sum() >= 2:
+                # 至少保留 2 个样本，才能构成有效 batch 内对比
+                image_enc_fg = image_enc[fg_mask]
+                text_enc_fg = text_enc[fg_mask]
+                loss_enc = self.vtc_loss(image_enc_fg, text_enc_fg) * self.loss_weight_enc
+            else:
+                # 当前 batch 全为背景，encoder 损失置 0，不回传梯度
+                loss_enc = image_enc.sum() * 0.0
+        else:
+            loss_enc = self.vtc_loss(image_enc, text_enc) * self.loss_weight_enc
+
         loss_dec = self.vtc_loss(image_dec, text_dec) * self.loss_weight_dec
 
         return {"loss_enc_vtc": loss_enc, "loss_dec_vtc": loss_dec}
@@ -385,6 +412,7 @@ class ZsOadCLIP(nn.Module):
         self,
         image: torch.Tensor,
         text: tuple[torch.Tensor, torch.Tensor] | torch.Tensor | None = None,
+        enc_target: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor] | torch.Tensor:
         """统一前向入口。
 
@@ -394,6 +422,8 @@ class ZsOadCLIP(nn.Module):
                 训练有监督模式: (enc_target [B,T], dec_target [B,dec_q])
                 训练对比模式:   text token [B, 1+dec_q, 77]
                 推理模式:       text_weights [D, num_class] 或 None
+            enc_target: [B, T] 逐帧类别标注，仅零样本对比训练时使用，
+                        用于过滤背景帧不参与 encoder 侧对比损失。
         """
         if self.training:
             if not self.zero_shot:
@@ -401,11 +431,11 @@ class ZsOadCLIP(nn.Module):
                 assert isinstance(text, tuple) and len(text) == 2, (
                     "有监督训练需要传入 (enc_target, dec_target) 元组"
                 )
-                enc_target, dec_target = text
-                return self.forward_train_supervised(image, enc_target, dec_target)
+                enc_target_sup, dec_target = text
+                return self.forward_train_supervised(image, enc_target_sup, dec_target)
             else:
-                # 零样本对比预训练
-                return self.forward_train_contrastive(image, text)
+                # 零样本对比预训练：传入 enc_target 以过滤背景帧
+                return self.forward_train_contrastive(image, text, enc_target=enc_target)
         else:
             return self.forward_test(image, text)
 
@@ -449,6 +479,7 @@ def build_model(
     freeze_mode: str = "none",
     loss_weight_enc: float = 1.0,
     loss_weight_dec: float = 1.0,
+    bg_class_id: int = 0,
 ) -> ZsOadCLIP:
     """构建并初始化 ZsOadCLIP 模型，控制参数冻结策略。
 
@@ -469,6 +500,7 @@ def build_model(
             "text"  — 仅微调文本编码器 + OadTransformer
         loss_weight_enc: Encoder 损失权重
         loss_weight_dec: Decoder 损失权重
+        bg_class_id: 背景类 id（对比训练时过滤，默认 0）
 
     Returns:
         配置好梯度策略的 ZsOadCLIP 实例
@@ -485,6 +517,7 @@ def build_model(
         add_fuse=add_fuse,
         loss_weight_enc=loss_weight_enc,
         loss_weight_dec=loss_weight_dec,
+        bg_class_id=bg_class_id,
     )
 
     # 1. 初始状态：全部冻结

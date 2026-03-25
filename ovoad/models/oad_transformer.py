@@ -371,7 +371,7 @@ class OadTransformer(nn.Module):
         2. Decoder：以可学习的查询 token 为 Q，编码器输出为 KV，预测当前动作
 
     零样本模式（zero_shot=True）：
-        - 输出特征向量，与文本嵌入做余弦相似度
+        - 输出特征向量，通过显式投影头对齐 CLIP 文本空间，与文本嵌入做余弦相似度
     有监督模式（zero_shot=False）：
         - 直接输出分类 logits，使用交叉熵损失
 
@@ -381,6 +381,7 @@ class OadTransformer(nn.Module):
         decoder_query_frames: Decoder 查询 token 数（dec_query）
         encoder_embedding_dim: Encoder 特征维度
         decoder_embedding_dim: Decoder 特征维度
+        clip_embed_dim: CLIP 文本空间目标维度；zero_shot=True 时输出将投影到此维度
         encoder_num_heads: Encoder 注意力头数
         decoder_num_heads: Decoder 注意力头数
         encoder_layers: Encoder 层数
@@ -406,6 +407,7 @@ class OadTransformer(nn.Module):
         decoder_query_frames: int = 8,
         encoder_embedding_dim: int = 512,
         decoder_embedding_dim: int = 512,
+        clip_embed_dim: int = 512,
         encoder_num_heads: int = 8,
         decoder_num_heads: int = 4,
         encoder_layers: int = 3,
@@ -435,6 +437,7 @@ class OadTransformer(nn.Module):
         self.num_class = num_class
         self.encoder_embedding_dim = encoder_embedding_dim
         self.decoder_embedding_dim = decoder_embedding_dim
+        self.clip_embed_dim = clip_embed_dim
 
         # ── Encoder ──────────────────────────────────────────────────
         self.global_tokens = 1 if class_token else 0
@@ -503,13 +506,26 @@ class OadTransformer(nn.Module):
             self.cross_entropy = nn.CrossEntropyLoss()
 
         if self.zero_shot:
-            # 零样本：拼接 enc+dec 特征后可选投影
+            # 零样本：融合 enc+dec 后，通过投影头显式对齐 CLIP 文本空间
+            # add_fuse=True  → concat(enc, dec) → Linear(enc+dec → clip_embed_dim)
+            # add_fuse=False → (enc + dec) 直接相加 → Linear(enc_dim → clip_embed_dim)
+            #   当 encoder_embedding_dim == clip_embed_dim 时，该线性层为恒等初始化的
+            #   低秩适配层，仍保留以便梯度流动与显式空间对齐。
             if self.add_fuse:
-                self.mlp_head = nn.Linear(
-                    encoder_embedding_dim + decoder_embedding_dim, encoder_embedding_dim
+                self.mlp_head = nn.Sequential(
+                    nn.Linear(encoder_embedding_dim + decoder_embedding_dim, clip_embed_dim),
+                    nn.LayerNorm(clip_embed_dim),
                 )
             else:
-                self.mlp_head = nn.Identity()
+                self.mlp_head = nn.Sequential(
+                    nn.Linear(encoder_embedding_dim, clip_embed_dim),
+                    nn.LayerNorm(clip_embed_dim),
+                )
+            # decoder 各 token 也需投影到相同 CLIP 空间
+            self.dec_proj = nn.Sequential(
+                nn.Linear(decoder_embedding_dim, clip_embed_dim),
+                nn.LayerNorm(clip_embed_dim),
+            )
         else:
             # 有监督：拼接后分类
             self.mlp_head = nn.Linear(
@@ -570,13 +586,13 @@ class OadTransformer(nn.Module):
 
         # 融合 encoder CLS token 与 decoder 平均特征
         if self.zero_shot and not self.add_fuse:
-            # 直接相加（不做 concat）
-            x_fused = x[:, -1] + dec_for_token                   # [B, dim]
+            # 直接相加后投影到 CLIP 空间
+            x_fused = self.mlp_head(x[:, -1] + dec_for_token)     # [B, clip_embed_dim]
         else:
             # 拼接并通过 MLP 投影
-            x_fused = torch.cat((x[:, -1], dec_for_token), dim=1)  # [B, enc_dim + dec_dim]
-
-        x_fused = self.mlp_head(x_fused)  # [B, dim] 或 [B, num_class]
+            x_fused = self.mlp_head(
+                torch.cat((x[:, -1], dec_for_token), dim=1)
+            )                                                       # [B, clip_embed_dim 或 num_class]
 
         # ── 返回值 ────────────────────────────────────────────────────
         if not self.zero_shot:
@@ -591,5 +607,6 @@ class OadTransformer(nn.Module):
             ) * self.loss_weight_dec
             return {"loss_enc_vtc": loss_enc, "loss_dec_vtc": loss_dec}
         else:
-            # 零样本：返回 [B, 1+dec_q, dim] 供文本对比
-            return torch.cat((x_fused.unsqueeze(1), dec), dim=1)
+            # 零样本：将 dec 各 token 也投影到 CLIP 空间，返回 [B, 1+dec_q, clip_embed_dim]
+            dec_proj = self.dec_proj(dec)                          # [B, dec_q, clip_embed_dim]
+            return torch.cat((x_fused.unsqueeze(1), dec_proj), dim=1)

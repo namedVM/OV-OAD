@@ -214,6 +214,41 @@ def build_scheduler(
 
 
 @torch.no_grad()
+def build_zero_shot_text_weights(
+    model: torch.nn.Module,
+    class_names: list[str],
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """为零样本推理预计算类别文本嵌入权重矩阵。
+
+    对每个类别名称编码为 CLIP 文本特征，L2 归一化后转置，
+    得到形状 [D, num_classes] 的矩阵供余弦相似度计算。
+
+    仅在零样本模式（model.zero_shot=True）下调用；有监督模式返回 None。
+
+    Args:
+        model:       ZsOadCLIP 模型（unwrapped）
+        class_names: 按 id 排序的类别名称列表（index=0 为背景）
+        device:      目标设备
+
+    Returns:
+        text_weights: [D, num_classes] 或 None（有监督模式）
+    """
+    import clip as clip_lib
+
+    # 兼容 DDP / accelerate 包装，取裸模型
+    unwrapped = model.module if hasattr(model, "module") else model
+    if not unwrapped.zero_shot:
+        return None
+
+    texts = clip_lib.tokenize(class_names).to(device)  # [C, 77]
+    # encode_text 来自 TextEncoder，输出 [C, D]
+    text_feats = unwrapped.text_encoder(texts).float()
+    text_feats = F.normalize(text_feats, dim=-1)        # [C, D]
+    return text_feats.T.contiguous()                    # [D, C]
+
+
+@torch.no_grad()
 def validate(
     accelerator: Accelerator,
     model: torch.nn.Module,
@@ -221,10 +256,22 @@ def validate(
     class_names: list[str],
     epoch: int,
     global_step: int,
+    zero_shot: bool = False,
 ) -> dict[str, float]:
-    """分布式验证：accelerate 自动处理跨 GPU 的数据收集。"""
+    """分布式验证：accelerate 自动处理跨 GPU 的数据收集。
+
+    Args:
+        zero_shot: 是否为零样本模式。为 True 时会预计算文本权重传入模型。
+    """
     model.eval()
     num_classes = len(class_names)
+
+    # 零样本模式：预计算类别文本权重矩阵 [D, num_classes]
+    text_weights: Optional[torch.Tensor] = None
+    if zero_shot:
+        text_weights = build_zero_shot_text_weights(
+            model, class_names, device=accelerator.device
+        )
 
     all_probs: list[torch.Tensor] = []
     all_labels: list[torch.Tensor] = []
@@ -233,14 +280,21 @@ def validate(
         rgb = batch["rgb"]  # [B, T, D]，accelerate 已移到正确设备
         enc_target = batch["enc_target"]  # [B, T]
 
-        outputs = model(image=rgb, text=None)
-        # 有监督推理输出：[B, 1+dec_q, num_classes]，取 index=0（encoder 全局预测）
-        if isinstance(outputs, dict):
-            pred_logits = torch.zeros(rgb.shape[0], num_classes, device=rgb.device)
-        elif outputs.dim() == 3:
+        if zero_shot:
+            # 零样本推理：传入预计算文本权重，model.forward_test 走 zero_shot_pred 分支
+            # 输出 [B, 1+dec_q, num_classes]，取 index=0（encoder 全局预测）
+            outputs = model(image=rgb, text=text_weights)
             pred_logits = outputs[:, 0, :]  # [B, num_classes]
         else:
-            pred_logits = outputs
+            # 有监督推理：OadTransformer 直接输出分类 logits [B, 1+dec_q, num_classes]
+            outputs = model(image=rgb, text=None)
+            if isinstance(outputs, dict):
+                # 异常情况（推理时不应返回 dict），用全零占位
+                pred_logits = torch.zeros(rgb.shape[0], num_classes, device=rgb.device)
+            elif outputs.dim() == 3:
+                pred_logits = outputs[:, 0, :]  # [B, num_classes]
+            else:
+                pred_logits = outputs           # [B, num_classes]
 
         pred_probs = torch.softmax(pred_logits, dim=-1)  # [B, num_classes]
 
@@ -502,6 +556,7 @@ def main() -> None:
             class_names,
             epoch=0,
             global_step=0,
+            zero_shot=model_cfg.get("zero_shot", False),
         )
         if accelerator.is_main_process:
             logger.info(f"评估完成: {val_metrics}")
@@ -542,13 +597,18 @@ def main() -> None:
 
                 # zero_shot=True：传入 CLIP token（由 dataset 按 class_id 索引）
                 #                 text shape [B, 1+dec_steps, 77]
+                #                 同时传入 enc_target 用于过滤背景帧
                 # zero_shot=False：传入有监督标注 (enc_target, dec_target)
                 if zero_shot:
                     text_input = batch["text"]  # [B, 1+dec_q, 77]
                 else:
                     text_input = (enc_target, dec_target)
 
-                losses = model(image=rgb, text=text_input)
+                losses = model(
+                    image=rgb,
+                    text=text_input,
+                    enc_target=enc_target if zero_shot else None,
+                )
                 loss_enc = losses.get(
                     "loss_enc_vtc", torch.tensor(0.0, device=rgb.device)
                 )
@@ -625,6 +685,7 @@ def main() -> None:
                 class_names,
                 epoch=epoch,
                 global_step=global_step,
+                zero_shot=zero_shot,
             )
             is_best = val_metrics["map"] > best_metrics["map"]
             if is_best:
